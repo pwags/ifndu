@@ -1,0 +1,483 @@
+#!/usr/bin/env python
+
+"""
+ifndu.py
+
+Sandisk IF BSSD non-distruptable update.
+
+Copyright (c) 2016  Nexenta Systems
+William Kettler <william.kettler@nexenta.com>
+"""
+
+import getopt
+import sys
+import logging
+import subprocess
+import signal
+import re
+import time
+
+
+version = "0.1"
+
+# Logger
+logger = logging.getLogger()
+log = "ifndu.log"
+
+
+def usage():
+    """
+    Print usage.
+
+    Inputs:
+        None
+    Outputs:
+        None
+    """
+    cmd = sys.argv[0]
+
+    print "%s -r [-h] [-o OPTION]" % cmd
+    print ""
+    print "Sandisk IF BSSD non-distruptable update."
+    print ""
+    print "Arguments:"
+    print ""
+    print "    -h, --help           print usage"
+    print "    -p, --path           path to firmware.bin"
+    print "    -v, --version        print version"
+    print "    -d, --debug          debug output"
+
+
+class Signal(Exception):
+    """
+    This exception is raise by the signal handler.
+    """
+    pass
+
+
+class Timeout(Exception):
+    """
+    This exception is raised when the command exceeds the defined timeout
+    duration and the command is killed.
+    """
+    def __init__(self, cmd, timeout):
+        self.cmd = cmd
+        self.timeout = timeout
+
+    def __str__(self):
+        return "Command '%s' timed out after %d second(s)." % \
+               (self.cmd, self.timeout)
+
+
+class Retcode(Exception):
+    """
+    This exception is raise when a command exits with a non-zero exit status.
+    """
+    def __init__(self, cmd, retcode, output=None):
+        self.cmd = cmd
+        self.retcode = retcode
+        self.output = output
+
+    def __str__(self):
+        return "Command '%s' returned non-zero exit status %d" % \
+               (self.cmd, self.retcode)
+
+
+def alarm_handler(signum, frame):
+    """
+    Alarm handler for the execute function.
+    """
+    raise Signal
+
+
+def execute(cmd, timeout=None):
+    """
+    Execute a command in the default shell. If a timeout is defined the command
+    will be killed if the timeout is exceeded and an exception will be raised.
+
+    Inputs:
+        cmd     (str): Command to execute
+        timeout (int): Command timeout in seconds
+    Outputs:
+        output (str): STDOUT/STDERR
+    """
+    logger.debug(cmd)
+
+    # Define the timeout signal
+    if timeout:
+        signal.signal(signal.SIGALRM, alarm_handler)
+        signal.alarm(timeout)
+
+    try:
+        # Execute the command and wait for the subprocess to terminate
+        # STDERR is redirected to STDOUT
+        phandle = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT)
+
+        # Read the stdout/sterr buffers and retcode
+        output, _ = phandle.communicate()
+        retcode = phandle.poll()
+    except Signal:
+        # Kill the running process
+        phandle.kill()
+        raise Timeout(cmd=cmd, timeout=timeout)
+    except:
+        logger.debug("Unhandled exception.", exc_info=True)
+        raise
+    else:
+        # Possible race condition where alarm isn't disabled in time
+        signal.alarm(0)
+
+    # Raise an exception if the command exited with non-zero exit status
+    if retcode:
+        raise Retcode(cmd, retcode, output=output)
+
+    logger.debug(output)
+
+    return output
+
+
+def quote(argument):
+    """
+    Quote arguments being passed to the POSIX shell to avoid errors resulting
+    from special chars or spaces.
+
+    http://code.activestate.com/recipes/
+    498202-quote-python-strings-for-safe-use-in-posix-shells/
+
+    Inputs:
+        argument (str): Argument to be quoted
+    Outputs:
+        quoted (str): Quoted argument
+    """
+    quoted = "\\'".join("'" + p + "'" for p in argument.split("'"))
+
+    return quoted
+
+
+def zpool_online(pool, disk):
+    """
+    Online a zpool device.
+
+    Inputs:
+        pool (str): Pool
+        disk (str): Device
+    Outputs:
+        None
+    """
+    logger.info("Onlining disk %s.", disk)
+
+    try:
+        execute("zpool online %s %s" % (quote(pool), quote(disk)))
+    except Exception, err:
+        logger.error(str(err))
+        logger.error("Failed to online disk!")
+        sys.exit(1)
+
+    logger.debug("Online complete!")
+
+
+def zpool_offline(pool, disk):
+    """
+    Offline a zpool device.
+
+    Inputs:
+        pool (str): Pool
+        disk (str): Device
+    Outputs:
+        None
+    """
+    # We don't want to take any risk if the pools aren't healthy
+    if not get_zpool_health(pool):
+        logger.error("The pool %s is in a degraded state!", pool)
+        sys.exit(1)
+
+    logger.info("Offlining disk %s.", disk)
+    try:
+        execute("zpool offline -t %s %s" % (quote(pool), quote(disk)))
+    except Exception, err:
+        logger.error(str(err))
+        logger.error("Failed to offline disk!")
+        sys.exit(1)
+
+    logger.debug("Offline complete!")
+
+
+def get_zpools():
+    """
+    Get a list of imported zpools.
+
+    Inputs:
+        None
+    Outputs:
+        zpools (dict): Imported zpools
+    """
+    logger.info("Generating a list of imported pools.")
+
+    try:
+        output = execute("zpool list -Hp -o name")
+    except Exception, err:
+        logger.error(str(err))
+        logger.error("Failed to generate a pool list!")
+        sys.exit(1)
+
+    zpools = [x for x in output.split() if x != "syspool" and x != "rpool"]
+
+    logger.debug("Pool list generation complete!")
+    logger.debug(zpools)
+
+    return zpools
+
+
+def get_zpool_disks(pool):
+    """
+    Get a list of zpool devices.
+
+    Inputs:
+        pool (str): Pool name
+    Outputs:
+        disks (list): Pool devices
+    """
+    disks = []
+
+    logger.info("Generating a disk list for %s.", pool)
+
+    try:
+        output = execute("zpool status %s" % quote(pool))
+    except Exception, err:
+        logger.error(str(err))
+        logger.error("Unable to generate a disk list!")
+        sys.exit(1)
+
+    # Parse out the devids
+    for line in output.splitlines():
+        if re.search(r'(c[0-9]+t.*d[0-9]+)', line):
+            disks.append(line.split()[0])
+
+    logger.debug("Device list generation complete!")
+
+    return disks
+
+
+def get_zpool_health(pool):
+    """
+    Return the zpool health.
+
+    Inputs:
+        pool (str): Pool name
+    Outputs:
+        health (bool): Pool health
+    """
+    logger.info("Determining health status for pool %s.", pool)
+
+    try:
+        output = execute("zpool status -xv %s" % quote(pool))
+    except Exception, err:
+        logger.error(str(err))
+        logger.error("Failed to determine pool health!")
+        sys.exit(1)
+
+    if "is healthy" in output:
+        logger.debug("The pool %s is healthy.", pool)
+        health = True
+    else:
+        logger.debug("The pool %s is degraded.", pool)
+        health = False
+
+    return health
+
+
+def get_resilver_status(pool):
+    """
+    Determine resilver status.
+
+    Inputs:
+        pool (str): Pool
+    Outputs:
+        status (Bool): Resilver status
+    """
+    resilver = False
+
+    logger.info("Determining resilver status for pool %s.", pool)
+
+    try:
+        output = execute("zpool status %s" % quote(pool))
+    except Exception, err:
+        logger.error(str(err))
+        logger.error("Failed to determine pool status!")
+        sys.exit(1)
+
+    for line in output.splitlines():
+        if "resilver in progress" in line:
+            logger.debug("Resilver in progress for pool %s.", pool)
+            resilver = True
+            break
+
+    return resilver
+
+
+def get_slotmap():
+    """
+    Get the IF slotmap.
+
+    Inputs:
+        None
+    Outputs:
+        slotmap (dict): Disk to slot mapping
+    """
+    slotmap = {}
+
+    logger.info("Generating the enlcosure slotmap.")
+
+    try:
+        logger.debug("Generating the enclosure list.")
+        output = execute("ifcli encl show")
+    except Exception, err:
+        logger.error(str(err))
+        logger.error("Unable to generate the enclosure list!")
+        sys.exit(1)
+
+    encls = [line.split()[0] for line in output.splitlines()
+             if line.startswith("encl")]
+    logger.debug(encls)
+
+    for encl in encls:
+        try:
+            logger.debug("Generating the enclosure slotmap for %s.", encl)
+            output = execute("ifcli %s/slot/drive show" % quote(encl))
+        except Exception, err:
+            logger.error(str(err))
+            logger.error("Unable to generate the enclosure list!")
+            sys.exit(1)
+
+    for line in output.splitlines():
+        if line.startswith("encl"):
+            encl, slot, _, _, _, disk = line.split("/")
+            slotmap[disk] = (encl.split("encl")[1], slot.split("slot")[1])
+
+    logger.debug(slotmap)
+    logger.debug("Enclosure slotmap complete!")
+
+    return slotmap
+
+
+def update_disk(disk, pool, encl, slot, path):
+    """
+    Update the device firmware.
+
+    Inputs:
+        disk (str): Device
+        pool (str): Pool name
+        slot (str): Enclosure slot
+        path (str): Path to the firmware binary
+    Outputs:
+        None
+    """
+    # Offline the device before upgrading to prevent the device from faulting
+    zpool_offline(pool, disk)
+
+    # Update the device firmware
+    logger.info("Updating disk firmware for %s.", disk)
+    try:
+        execute("ifcli encl%s update -p %s -a -t drive -l "
+                "encl%s/slot%s/drive -f" % (quote(encl), quote(path),
+                                            quote(encl), quote(slot)))
+    except Exception, err:
+        logger.error(str(err))
+        logger.error("Update failed!")
+        sys.exit(1)
+    finally:
+        # Online the device whether the upgrade succeeds or fails
+        zpool_online(pool, disk)
+
+    # Wait for the pool to finish resilvering before proceeding
+    while get_resilver_status(pool):
+        logger.info("Resilver still in progress...")
+        time.sleep(5)
+
+    logger.info("Update complete!")
+
+
+def update_all(path):
+    """
+    Iterate over each device and update non-distruptively.
+
+    Inputs:
+        path (str): Path to the firmware binary
+    Ouputs:
+        None
+    """
+    slotmap = get_slotmap()
+
+    # Iterate over all disks in all zpools
+    pools = get_zpools()
+    poolct = 1
+    for pool in pools:
+        disks = get_zpool_disks(pool)
+        diskct = 1
+        for disk in disks:
+            # Log current progress
+            logger.info("Pool (%s/%s) Drive (%s/%s)", poolct, len(pools),
+                        diskct, len(disks))
+            encl, slot = slotmap["%sp0" % disk]
+            update_disk(disk, pool, encl, slot, path)
+            diskct += 1
+        poolct += 1
+
+
+def main():
+    """
+    Main loop.
+    """
+    # Parse command line arguments
+    try:
+        opts, _ = getopt.getopt(sys.argv[1:], ":hp:dv", ["help", "path=",
+                                                         "debug", "version"])
+    except getopt.GetoptError as err:
+        print str(err)
+        usage()
+        sys.exit(2)
+
+    # Initialize required arguments
+    path = None
+    level = logging.INFO
+
+    for opt, arg in opts:
+        if opt in ("-h", "--help"):
+            usage()
+            sys.exit()
+        elif opt in ("-p", "--path"):
+            path = arg
+        elif opt in ("-d", "--debug"):
+            level = logging.DEBUG
+        elif opt in ("-v", "--version"):
+            print version
+            sys.exit(0)
+
+    # Logging config
+    logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s",
+                        filename=log, level=logging.DEBUG,
+                        datefmt='%Y-%m-%d %I:%M:%S')
+    console = logging.StreamHandler()
+    console.setLevel(level)
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    console.setFormatter(formatter)
+    logging.getLogger('').addHandler(console)
+
+    # Confirm the path was provided and exists
+    if path is None:
+        logger.error("A firmware path must be specified!")
+        usage()
+        sys.exit(2)
+
+    update_all(path)
+
+    logger.info("Complete!")
+    logging.shutdown()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("Killed by user")
